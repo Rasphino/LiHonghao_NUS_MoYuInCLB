@@ -1,8 +1,10 @@
+pub mod schema;
+
 use chrono::{Datelike, Duration, NaiveDateTime, NaiveTime};
 
 /// `RobotStatus` encodes the different status of the robot.
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-enum RobotStatus {
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
+pub enum RobotStatus {
     StandardDay = 1,
     ExtraDay = 2,
     StandardNight = 3,
@@ -43,18 +45,19 @@ impl Iterator for BreakIterator {
     }
 }
 
-struct RobotWorkTime {
+#[derive(Clone)]
+pub struct RobotWorkTime {
     start: NaiveDateTime,
     end: NaiveDateTime,
     time_segments: Vec<(NaiveTime, NaiveTime)>,
 }
 
 impl RobotWorkTime {
-    fn new(start: NaiveDateTime, end: NaiveDateTime, time_segments: Vec<(NaiveTime, NaiveTime)>) -> Self {
+    pub fn new(start: NaiveDateTime, end: NaiveDateTime, time_segments: Vec<(NaiveTime, NaiveTime)>) -> Self {
         Self { start, end, time_segments }
     }
 
-    fn into_iter(self) -> RobotWorkTimeIterator {
+    pub fn into_iter(self) -> RobotWorkTimeIterator {
         let RobotWorkTime { time_segments, start, end: _ } = self;
         let time_segs_to_robot_status = vec![RobotStatus::StandardDay, RobotStatus::StandardNight];
 
@@ -163,7 +166,7 @@ impl Iterator for TimeSegmentsIterator {
 
 /// `RobotWorkTimeIterator` combines `TimeSegmentsIterator` and `BreakIterator`, and produces a finite sequence of time points.
 #[derive(Eq, PartialEq, Debug)]
-struct RobotWorkTimeIterator {
+pub struct RobotWorkTimeIterator {
     cur: (NaiveDateTime, RobotStatus),
     end: NaiveDateTime,
     time_segments_iter: TimeSegmentsIterator,
@@ -329,5 +332,21 @@ mod tests {
         assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T06:00:00").unwrap(), NaiveDateTime::from_str("2021-09-06T07:00:00").unwrap())));
         assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T15:00:00").unwrap(), NaiveDateTime::from_str("2021-09-06T16:00:00").unwrap())));
         assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-07T00:00:00").unwrap(), NaiveDateTime::from_str("2021-09-07T01:00:00").unwrap())));
+    }
+
+    #[test]
+    fn integration_test_2() {
+        let t = RobotWorkTime::new(NaiveDateTime::from_str("2038-01-11T07:00:00").unwrap(),
+                                   NaiveDateTime::from_str("2038-01-17T19:00:00").unwrap(),
+                                   vec![(NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)),
+                                        (NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0))]
+        );
+        let s = t.clone().into_iter().zip(std::iter::once((NaiveDateTime::from_str("2038-01-11T07:00:00").unwrap(), RobotStatus::Finish)).chain(t.into_iter())).skip(1)
+            .fold(vec![Duration::zero(); 10], |mut acc, ((e, _), (s, status))| {
+                acc[status as usize] = acc[status as usize] + (e - s);
+                acc
+            });
+        let res = s[1].num_minutes()*20 + s[2].num_minutes()*30 + s[3].num_minutes()*25 + s[6].num_minutes()*35;
+        assert_eq!(res, 202200);
     }
 }
