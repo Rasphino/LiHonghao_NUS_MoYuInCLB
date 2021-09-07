@@ -50,7 +50,8 @@ This calculator will produce the result in json format, for example:
 
 ## Problem assumptions
 1. There are no gaps between day and night, i.e., if the day ends at 23:00, then the night must start at 23:00.
-2. Only four kinds of rates are supported, but the library part can be easily modified to support more rate schemes.
+2. Program input must in the same format as the sample is.
 
-## Todos
-1. Refactor the library part to support rate scheme independent counting.
+## Features
+1. Calculator is decoupled into a general library and a specific application.
+2. The library part is independent of rate scheme, see unit test: `robot_work_time_iter_test_complex_scheme` in `lib.rs`.
