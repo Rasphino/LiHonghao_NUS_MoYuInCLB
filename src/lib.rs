@@ -1,28 +1,66 @@
+use std::collections::HashSet;
+
+use chrono::{Datelike, Duration, NaiveDateTime, NaiveTime, Weekday};
+
 pub mod schema;
 
-use chrono::{Datelike, Duration, NaiveDateTime, NaiveTime};
-
-/// `RobotStatus` encodes the different status of the robot.
-#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
-pub enum RobotStatus {
-    StandardDay = 1,
-    ExtraDay = 2,
-    StandardNight = 3,
-    ExtraNight = 6,
-    Breaking = 0,
-    Finish = 10
+#[derive(Eq, PartialEq, Debug, Clone)]
+pub struct TimeRange {
+    start: NaiveTime,
+    end: NaiveTime,
+    valid_weekdays: HashSet<Weekday>,
 }
 
-impl RobotStatus {
-    fn from_u32(i: u32) -> Option<Self> {
-        match i {
-            x if x == Self::StandardDay as u32 => { Some(Self::StandardDay) }
-            x if x == Self::StandardNight as u32 => { Some(Self::StandardNight) }
-            x if x == Self::ExtraDay as u32 => { Some(Self::ExtraDay) }
-            x if x == Self::ExtraNight as u32 => { Some(Self::ExtraNight) }
-            x if x == Self::Breaking as u32 => { Some(Self::StandardDay) }
-            _ => { None }
+impl TimeRange {
+    pub fn new(range: (NaiveTime, NaiveTime), valid_weekdays: impl Iterator<Item=Weekday>) -> Self {
+        Self {
+            start: range.0,
+            end: range.1,
+            valid_weekdays: valid_weekdays.into_iter().collect::<HashSet<_>>(),
         }
+    }
+
+    pub fn contains(&self, datetime: NaiveDateTime) -> bool {
+        if self.valid_weekdays.contains(&datetime.date().weekday()) {
+            let t = datetime.time();
+            if (self.start < self.end && t >= self.start && t < self.end) || (self.start > self.end && (t >= self.start || t < self.end)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn get_next_range_start_at(&self, datetime: NaiveDateTime) -> Option<(NaiveDateTime, NaiveDateTime)> {
+        let t = datetime.time();
+        let d = datetime.date();
+
+        let ans = if self.start < self.end {
+            if t >= self.start && t < self.end {
+                Some((datetime, d.and_time(self.end)))
+            } else {
+                None
+            }
+        } else {
+            if t < self.start && t > self.end {
+                None
+            } else if t >= self.start {
+                // from datetime to the end of the day
+                Some((datetime, d.and_hms(0, 0, 0) + Duration::days(1)))
+            } else if t < self.end {
+                // from datetime to the end of this range
+                Some((datetime, d.and_time(self.end)))
+            } else {
+                None
+            }
+        };
+
+        ans.map(|(mut s, mut e)| {
+            while !self.valid_weekdays.contains(&s.date().weekday()) {
+                s += Duration::days(1);
+                e += Duration::days(1);
+            }
+            (s, e)
+        })
     }
 }
 
@@ -49,56 +87,19 @@ impl Iterator for BreakIterator {
 pub struct RobotWorkTime {
     start: NaiveDateTime,
     end: NaiveDateTime,
-    time_segments: Vec<(NaiveTime, NaiveTime)>,
+    time_range: Vec<TimeRange>,
 }
 
 impl RobotWorkTime {
-    pub fn new(start: NaiveDateTime, end: NaiveDateTime, time_segments: Vec<(NaiveTime, NaiveTime)>) -> Self {
-        Self { start, end, time_segments }
+    pub fn new(start: NaiveDateTime, end: NaiveDateTime, time_range: Vec<TimeRange>) -> Self {
+        Self { start, end, time_range }
     }
 
     pub fn into_iter(self) -> RobotWorkTimeIterator {
-        let RobotWorkTime { time_segments, start, end: _ } = self;
-        let time_segs_to_robot_status = vec![RobotStatus::StandardDay, RobotStatus::StandardNight];
+        let RobotWorkTime { time_range, start, end: _ } = self;
 
-        let t = start.time();
-        let d = start.date();
-        let mut robot_status = RobotStatus::Breaking;
-        let time_segments = time_segments.into_iter().enumerate().map(|(idx, (s, e))| {
-            if s < e {
-                if t >= s && t < e {
-                    robot_status = time_segs_to_robot_status[idx];
-                    (NaiveDateTime::new(d + Duration::days(1), s), NaiveDateTime::new(d + Duration::days(1), e))
-                } else if t < s {
-                    (NaiveDateTime::new(d, s), NaiveDateTime::new(d, e))
-                } else {
-                    (NaiveDateTime::new(d + Duration::days(1), s), NaiveDateTime::new(d + Duration::days(1), e))
-                }
-            } else {
-                if t >= s || t < e {
-                    robot_status = time_segs_to_robot_status[idx];
-                    if t >= s {
-                        (NaiveDateTime::new(d + Duration::days(1), s), NaiveDateTime::new(d + Duration::days(2), e))
-                    } else {
-                        (NaiveDateTime::new(d, s), NaiveDateTime::new(d + Duration::days(1), e))
-                    }
-                } else {
-                    (NaiveDateTime::new(d, s), NaiveDateTime::new(d + Duration::days(1), e))
-                }
-            }
-        }).collect::<Vec<_>>();
-        use chrono::Weekday::*;
-        match start.date().weekday() {
-            Sat | Sun => { robot_status = RobotStatus::from_u32(robot_status as u32 * 2).unwrap() }
-            _ => {}
-        }
-
-        let mut time_segments_iter = TimeSegmentsIterator {
-            cur: (start, robot_status),
-            time_segments
-        };
-        time_segments_iter.next();
-
+        let mut time_ranges_iter = TimeRangesIterator::new(start, time_range).unwrap();
+        let cur = time_ranges_iter.next().unwrap();
         let break_iter = BreakIterator {
             start: self.start,
             work_duration: Duration::hours(8),
@@ -106,105 +107,109 @@ impl RobotWorkTime {
         };
 
         RobotWorkTimeIterator {
-            cur: (self.start, robot_status),
+            cur: (cur.0, Some(cur.1)),
             end: self.end,
-            time_segments_iter,
+            time_ranges_iter,
             break_iter,
             breaking: None,
-            is_finish: false
+            is_finish: false,
         }
     }
 }
 
 /// `TimeSegmentsIterator` produces a infinite sequence of time points, at which the robot status (and the corresponding rates) changed.
 #[derive(Eq, PartialEq, Debug, Clone)]
-struct TimeSegmentsIterator {
-    cur: (NaiveDateTime, RobotStatus),
-    time_segments: Vec<(NaiveDateTime, NaiveDateTime)>,
+struct TimeRangesIterator {
+    cur: (NaiveDateTime, usize),
+    time_ranges: Vec<TimeRange>,
 }
 
-impl Iterator for TimeSegmentsIterator {
-    type Item = (NaiveDateTime, RobotStatus);
+impl TimeRangesIterator {
+    pub fn new(start: NaiveDateTime, time_ranges: Vec<TimeRange>) -> Option<Self> {
+        let mut next_idx = None;
+        for (idx, range) in time_ranges.iter().enumerate() {
+            if range.contains(start) {
+                next_idx = Some(idx)
+            }
+        }
+        Some(Self {
+            cur: (start, next_idx?),
+            time_ranges,
+        })
+    }
+}
+
+impl Iterator for TimeRangesIterator {
+    type Item = (NaiveDateTime, usize);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let ret = self.cur.clone();
-        let (date_time, _status) = self.cur.clone();
+        let ret = self.cur;
+        let (date_time, _idx) = self.cur;
 
-        let (min_idx, _) = self.time_segments.iter_mut().enumerate().min_by_key(|(_idx, seg)| (**seg).0).unwrap();
-        let mut new_cur_dt = self.time_segments[min_idx].0;
+        let (_, next_dt) = self.time_ranges.iter()
+            .filter_map(|time_range| {
+                time_range.get_next_range_start_at(date_time)
+            })
+            .min_by_key(|(_, next_dt)| *next_dt)
+            .unwrap();
 
-        let time_segs_to_robot_status = vec![RobotStatus::StandardDay, RobotStatus::StandardNight];
-        let mut new_status = time_segs_to_robot_status[min_idx];
-        use chrono::Weekday::*;
-        match new_cur_dt.date().weekday() {
-            Sat | Sun => {
-                new_status = RobotStatus::from_u32(new_status as u32 * 2).unwrap()
+        let mut next_idx = None;
+        for (idx, range) in self.time_ranges.iter().enumerate() {
+            if range.contains(next_dt) {
+                next_idx = Some(idx)
             }
-            _ => {}
         }
+        let next_idx = next_idx.unwrap();
 
-        if date_time.date().weekday() == Sun && new_cur_dt.date().weekday() == Mon {
-            new_cur_dt = new_cur_dt.date().and_hms(0, 0, 0);
-            new_status = RobotStatus::StandardNight;
-            self.cur = (new_cur_dt, new_status);
-            return Some(ret);
-        }
-        if date_time.date().weekday() == Fri && new_cur_dt.date().weekday() == Sat {
-            new_cur_dt = new_cur_dt.date().and_hms(0, 0, 0);
-            new_status = RobotStatus::ExtraNight;
-            self.cur = (new_cur_dt, new_status);
-            return Some(ret);
-        }
-
-        self.cur = (new_cur_dt, new_status);
-        self.time_segments[min_idx].0 += Duration::days(1);
-        self.time_segments[min_idx].1 += Duration::days(1);
-
-        return Some(ret);
+        self.cur = (next_dt, next_idx);
+        Some(ret)
     }
 }
 
 /// `RobotWorkTimeIterator` combines `TimeSegmentsIterator` and `BreakIterator`, and produces a finite sequence of time points.
 #[derive(Eq, PartialEq, Debug)]
 pub struct RobotWorkTimeIterator {
-    cur: (NaiveDateTime, RobotStatus),
+    cur: (NaiveDateTime, Option<usize>),
     end: NaiveDateTime,
-    time_segments_iter: TimeSegmentsIterator,
+    time_ranges_iter: TimeRangesIterator,
     break_iter: BreakIterator,
-    breaking: Option<(NaiveDateTime, RobotStatus)>,
-    is_finish: bool
+    breaking: Option<(NaiveDateTime, Option<usize>)>,
+    is_finish: bool,
 }
 
 impl Iterator for RobotWorkTimeIterator {
-    type Item = (NaiveDateTime, RobotStatus);
+    type Item = (NaiveDateTime, Option<usize>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let ret = self.cur.clone();
+        let ret = self.cur;
         if self.is_finish { return None; }
-        if ret.0 >= self.end { self.is_finish = true; return Some((self.end, RobotStatus::Finish)); }
+        if ret.0 >= self.end {
+            self.is_finish = true;
+            return Some((self.end, None));
+        }
 
         if let Some((break_end, mut end_status)) = self.breaking.take() {
-            let mut time_segments_iter = self.time_segments_iter.clone();
-            let (next_time_seg, next_status) = time_segments_iter.next().unwrap().clone();
+            let mut time_ranges_iter = self.time_ranges_iter.clone();
+            let (next_time_seg, next_status) = time_ranges_iter.next().unwrap();
             if next_time_seg <= break_end {
-                end_status = next_status;
-                self.time_segments_iter.next();
+                end_status = Some(next_status);
+                self.time_ranges_iter.next();
             }
             self.cur = (break_end, end_status);
             return Some(ret);
         }
 
-        let mut time_segments_iter = self.time_segments_iter.clone();
-        let (next_time_seg, next_status) = time_segments_iter.next().unwrap().clone();
+        let mut time_ranges_iter = self.time_ranges_iter.clone();
+        let (next_time_seg, next_status) = time_ranges_iter.next().unwrap();
 
         let mut break_iter = self.break_iter.clone();
-        let (break_begin, break_end) = break_iter.next().unwrap().clone();
+        let (break_begin, break_end) = break_iter.next().unwrap();
 
         if next_time_seg < break_begin {
-            self.cur = (next_time_seg, next_status);
-            self.time_segments_iter.next();
+            self.cur = (next_time_seg, Some(next_status));
+            self.time_ranges_iter.next();
         } else {
-            self.cur = (break_begin, RobotStatus::Breaking);
+            self.cur = (break_begin, None);
             self.breaking = Some((break_end, ret.1));
             self.break_iter.next();
         }
@@ -215,26 +220,46 @@ impl Iterator for RobotWorkTimeIterator {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::str::FromStr;
+
+    use super::*;
+
+    fn weekend() -> impl Iterator<Item=Weekday> {
+        use Weekday::*;
+        vec![Sat, Sun].into_iter()
+    }
+
+    fn weekday() -> impl Iterator<Item=Weekday> {
+        use Weekday::*;
+        vec![Mon, Tue, Wed, Thu, Fri].into_iter()
+    }
 
     #[test]
     fn robot_work_time_iter_test() {
-        let t = RobotWorkTime::new(NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(),
-                                   NaiveDateTime::from_str("2021-09-06T12:59:00").unwrap(),
-                                   vec![(NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)),
-                                        (NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)),
-                                   ]
+        let t = RobotWorkTime::new(
+            NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(),
+            NaiveDateTime::from_str("2021-09-06T12:59:00").unwrap(),
+            vec![
+                TimeRange::new((NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)), weekend()),
+                TimeRange::new((NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)), weekend()),
+            ],
         );
 
-        let mut time_segments_iter = TimeSegmentsIterator {
-            cur: (NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(), RobotStatus::ExtraDay),
-            time_segments: vec![(NaiveDateTime::from_str("2021-09-06T07:00:00").unwrap(), NaiveDateTime::from_str("2021-09-06T23:00:00").unwrap()),
-                                (NaiveDateTime::from_str("2021-09-05T23:00:00").unwrap(), NaiveDateTime::from_str("2021-09-06T07:00:00").unwrap())]
-        };
-        time_segments_iter.next();
+        let mut time_ranges_iter = TimeRangesIterator::new(
+            NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(),
+            vec![
+                TimeRange::new((NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)), weekend()),
+                TimeRange::new((NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)), weekend()),
+            ],
+        ).unwrap();
+        time_ranges_iter.next();
+
         let mut it = RobotWorkTimeIterator {
-            cur: (NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(), RobotStatus::ExtraDay),
+            cur: (NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(), Some(2)),
             end: NaiveDateTime::from_str("2021-09-06T12:59:00").unwrap(),
             break_iter: BreakIterator {
                 start: NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(),
@@ -242,83 +267,122 @@ mod tests {
                 rest_duration: Duration::hours(1),
             },
             breaking: None,
-            time_segments_iter,
-            is_finish: false
+            time_ranges_iter,
+            is_finish: false,
         };
 
         assert_eq!(t.into_iter(), it);
 
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(), RobotStatus::ExtraDay)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-05T23:00:00").unwrap(), RobotStatus::ExtraNight)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T00:00:00").unwrap(), RobotStatus::StandardNight)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T06:00:00").unwrap(), RobotStatus::Breaking)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T07:00:00").unwrap(), RobotStatus::StandardDay)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T12:59:00").unwrap(), RobotStatus::Finish)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(), Some(2))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-05T23:00:00").unwrap(), Some(3))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T00:00:00").unwrap(), Some(1))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T06:00:00").unwrap(), None)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T07:00:00").unwrap(), Some(0))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T12:59:00").unwrap(), None)));
         assert_eq!(it.next(), None);
     }
 
     #[test]
     fn robot_work_time_iter_test_start_early() {
-        let t = RobotWorkTime::new(NaiveDateTime::from_str("2021-09-10T00:01:00").unwrap(),
-                                   NaiveDateTime::from_str("2021-09-12T00:30:00").unwrap(),
-                                   vec![(NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)),
-                                        (NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)),
-                                   ]
+        let t = RobotWorkTime::new(
+            NaiveDateTime::from_str("2021-09-10T00:01:00").unwrap(),
+            NaiveDateTime::from_str("2021-09-12T00:30:00").unwrap(),
+            vec![
+                TimeRange::new((NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)), weekend()),
+                TimeRange::new((NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)), weekend()),
+            ],
         );
         let mut it = t.into_iter();
 
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T00:01:00").unwrap(), RobotStatus::StandardNight)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T07:00:00").unwrap(), RobotStatus::StandardDay)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T08:01:00").unwrap(), RobotStatus::Breaking)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T09:01:00").unwrap(), RobotStatus::StandardDay)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T17:01:00").unwrap(), RobotStatus::Breaking)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T18:01:00").unwrap(), RobotStatus::StandardDay)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T23:00:00").unwrap(), RobotStatus::StandardNight)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T00:00:00").unwrap(), RobotStatus::ExtraNight)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T02:01:00").unwrap(), RobotStatus::Breaking)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T03:01:00").unwrap(), RobotStatus::ExtraNight)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T07:00:00").unwrap(), RobotStatus::ExtraDay)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T11:01:00").unwrap(), RobotStatus::Breaking)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T12:01:00").unwrap(), RobotStatus::ExtraDay)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T20:01:00").unwrap(), RobotStatus::Breaking)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T21:01:00").unwrap(), RobotStatus::ExtraDay)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T23:00:00").unwrap(), RobotStatus::ExtraNight)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-12T00:30:00").unwrap(), RobotStatus::Finish)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T00:01:00").unwrap(), Some(1))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T07:00:00").unwrap(), Some(0))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T08:01:00").unwrap(), None)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T09:01:00").unwrap(), Some(0))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T17:01:00").unwrap(), None)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T18:01:00").unwrap(), Some(0))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T23:00:00").unwrap(), Some(1))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T00:00:00").unwrap(), Some(3))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T02:01:00").unwrap(), None)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T03:01:00").unwrap(), Some(3))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T07:00:00").unwrap(), Some(2))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T11:01:00").unwrap(), None)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T12:01:00").unwrap(), Some(2))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T20:01:00").unwrap(), None)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T21:01:00").unwrap(), Some(2))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T23:00:00").unwrap(), Some(3))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-12T00:00:00").unwrap(), Some(3))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-12T00:30:00").unwrap(), None)));
         assert_eq!(it.next(), None);
     }
 
     #[test]
     fn robot_work_time_iter_test_start_late() {
-        let t = RobotWorkTime::new(NaiveDateTime::from_str("2021-09-10T23:01:00").unwrap(),
-                                   NaiveDateTime::from_str("2021-09-11T12:55:00").unwrap(),
-                                   vec![(NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)),
-                                        (NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)),
-                                   ]
+        let t = RobotWorkTime::new(
+            NaiveDateTime::from_str("2021-09-10T23:01:00").unwrap(),
+            NaiveDateTime::from_str("2021-09-11T12:55:00").unwrap(),
+            vec![
+                TimeRange::new((NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)), weekend()),
+                TimeRange::new((NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)), weekend()),
+            ],
         );
         let mut it = t.into_iter();
 
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T23:01:00").unwrap(), RobotStatus::StandardNight)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T00:00:00").unwrap(), RobotStatus::ExtraNight)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T07:00:00").unwrap(), RobotStatus::ExtraDay)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T07:01:00").unwrap(), RobotStatus::Breaking)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T08:01:00").unwrap(), RobotStatus::ExtraDay)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T12:55:00").unwrap(), RobotStatus::Finish)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T23:01:00").unwrap(), Some(1))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T00:00:00").unwrap(), Some(3))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T07:00:00").unwrap(), Some(2))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T07:01:00").unwrap(), None)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T08:01:00").unwrap(), Some(2))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T12:55:00").unwrap(), None)));
+        assert_eq!(it.next(), None);
+    }
+
+    #[test]
+    fn robot_work_time_iter_test_complex_scheme() {
+        let t = RobotWorkTime::new(
+            NaiveDateTime::from_str("2021-09-10T23:01:00").unwrap(),
+            NaiveDateTime::from_str("2021-09-11T20:55:00").unwrap(),
+            vec![
+                TimeRange::new((NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(3, 0, 0), NaiveTime::from_hms(15, 0, 0)), weekend()),
+                TimeRange::new((NaiveTime::from_hms(15, 0, 0), NaiveTime::from_hms(3, 0, 0)), weekend()),
+            ],
+        );
+        let mut it = t.into_iter();
+
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-10T23:01:00").unwrap(), Some(1))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T00:00:00").unwrap(), Some(3))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T03:00:00").unwrap(), Some(2))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T07:01:00").unwrap(), None)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T08:01:00").unwrap(), Some(2))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T15:00:00").unwrap(), Some(3))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T16:01:00").unwrap(), None)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T17:01:00").unwrap(), Some(3))));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-11T20:55:00").unwrap(), None)));
         assert_eq!(it.next(), None);
     }
 
     #[test]
     fn time_seg_iter_test() {
-        let mut it = TimeSegmentsIterator {
-            cur: (NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(), RobotStatus::ExtraDay),
-            time_segments: vec![(NaiveDateTime::from_str("2021-09-06T07:00:00").unwrap(), NaiveDateTime::from_str("2021-09-06T23:00:00").unwrap()),
-                                (NaiveDateTime::from_str("2021-09-05T23:00:00").unwrap(), NaiveDateTime::from_str("2021-09-06T07:00:00").unwrap())]
-        };
+        let mut it = TimeRangesIterator::new(
+            NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(),
+            vec![
+                TimeRange::new((NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)), weekend()),
+                TimeRange::new((NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)), weekend()),
+            ],
+        ).unwrap();
 
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(), RobotStatus::ExtraDay)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-05T23:00:00").unwrap(), RobotStatus::ExtraNight)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T00:00:00").unwrap(), RobotStatus::StandardNight)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T07:00:00").unwrap(), RobotStatus::StandardDay)));
-        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T23:00:00").unwrap(), RobotStatus::StandardNight)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(), 2)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-05T23:00:00").unwrap(), 3)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T00:00:00").unwrap(), 1)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T07:00:00").unwrap(), 0)));
+        assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T23:00:00").unwrap(), 1)));
     }
 
     #[test]
@@ -326,7 +390,7 @@ mod tests {
         let mut it = BreakIterator {
             start: NaiveDateTime::from_str("2021-09-05T22:00:00").unwrap(),
             work_duration: Duration::hours(8),
-            rest_duration: Duration::hours(1)
+            rest_duration: Duration::hours(1),
         };
 
         assert_eq!(it.next(), Some((NaiveDateTime::from_str("2021-09-06T06:00:00").unwrap(), NaiveDateTime::from_str("2021-09-06T07:00:00").unwrap())));
@@ -336,17 +400,24 @@ mod tests {
 
     #[test]
     fn integration_test_2() {
-        let t = RobotWorkTime::new(NaiveDateTime::from_str("2038-01-11T07:00:00").unwrap(),
-                                   NaiveDateTime::from_str("2038-01-17T19:00:00").unwrap(),
-                                   vec![(NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)),
-                                        (NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0))]
+        let t = RobotWorkTime::new(
+            NaiveDateTime::from_str("2038-01-11T07:00:00").unwrap(),
+            NaiveDateTime::from_str("2038-01-17T19:00:00").unwrap(),
+            vec![
+                TimeRange::new((NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)), weekday()),
+                TimeRange::new((NaiveTime::from_hms(7, 0, 0), NaiveTime::from_hms(23, 0, 0)), weekend()),
+                TimeRange::new((NaiveTime::from_hms(23, 0, 0), NaiveTime::from_hms(7, 0, 0)), weekend()),
+            ],
         );
-        let s = t.clone().into_iter().zip(std::iter::once((NaiveDateTime::from_str("2038-01-11T07:00:00").unwrap(), RobotStatus::Finish)).chain(t.into_iter())).skip(1)
-            .fold(vec![Duration::zero(); 10], |mut acc, ((e, _), (s, status))| {
-                acc[status as usize] = acc[status as usize] + (e - s);
+        let s = t.clone().into_iter().zip(std::iter::once((NaiveDateTime::from_str("2038-01-11T07:00:00").unwrap(), None)).chain(t.into_iter())).skip(1)
+            .fold(vec![Duration::zero(); 4], |mut acc, ((e, _), (s, status))| {
+                if let Some(idx) = status {
+                    acc[idx] = acc[idx] + (e - s);
+                }
                 acc
             });
-        let res = s[1].num_minutes()*20 + s[2].num_minutes()*30 + s[3].num_minutes()*25 + s[6].num_minutes()*35;
+        let res = s[0].num_minutes() * 20 + s[1].num_minutes() * 25 + s[2].num_minutes() * 30 + s[3].num_minutes() * 35;
         assert_eq!(res, 202200);
     }
 }
