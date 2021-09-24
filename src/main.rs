@@ -67,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
     let port = std::env::var("PORT")
         .unwrap_or("5000".to_string())
         .parse::<u16>()?;
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     println!("Listening on {}", addr);
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
