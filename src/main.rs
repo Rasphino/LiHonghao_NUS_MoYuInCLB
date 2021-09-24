@@ -1,3 +1,6 @@
+use axum::{handler::get, Router, response::Html};
+use std::net::SocketAddr;
+
 use std::io::{self, Read};
 use std::str::FromStr;
 
@@ -6,6 +9,8 @@ use serde_json::json;
 
 use robot_rate_calculator::{RobotWorkTime, TimeRange};
 use robot_rate_calculator::schema::RobotWorkSchema;
+use axum::http::StatusCode;
+use axum::handler::post;
 
 fn weekend() -> impl Iterator<Item=Weekday> {
     use Weekday::*;
@@ -17,7 +22,7 @@ fn weekday() -> impl Iterator<Item=Weekday> {
     vec![Mon, Tue, Wed, Thu, Fri].into_iter()
 }
 
-fn main() -> anyhow::Result<()> {
+fn robot() -> anyhow::Result<()> {
     let mut buffer = String::new();
     io::stdin().read_to_string(&mut buffer)?;
     let work_schema = serde_json::from_str::<RobotWorkSchema>(&buffer)?;
@@ -51,4 +56,32 @@ fn main() -> anyhow::Result<()> {
 
     println!("{}", json!({ "value": res }).to_string());
     Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let app = Router::new()
+        .route("/", get(root))
+        .route("/square", post(square_handle));
+
+    let port = std::env::var("PORT")
+        .unwrap_or("5000".to_string())
+        .parse::<u16>()?;
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    println!("Listening on {}", addr);
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
+
+    Ok(())
+}
+
+async fn root() -> Html<&'static str> {
+    Html("<h1>Hello, World!</h1>")
+}
+
+async fn square_handle(body: String) -> Result<String, StatusCode> {
+    let x = body.parse::<i64>().map_err(|_e| StatusCode::BAD_REQUEST)?;
+    x.checked_mul(x).map(|r| r.to_string()).ok_or(StatusCode::BAD_REQUEST)
 }
